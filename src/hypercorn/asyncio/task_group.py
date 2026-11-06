@@ -23,13 +23,16 @@ async def _handle(
     send: Callable[[ASGISendEvent | None], Awaitable[None]],
     sync_spawn: Callable,
     call_soon: Callable,
+    on_error: Callable[[BaseException], Awaitable[None]] | None = None,
 ) -> None:
     try:
         await app(scope, receive, send, sync_spawn, call_soon)
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as error:
         await config.log.exception("Error in ASGI Framework")
+        if on_error is not None:
+            await on_error(error)
     finally:
         await send(None)
 
@@ -45,6 +48,7 @@ class TaskGroup:
         config: Config,
         scope: Scope,
         send: Callable[[ASGISendEvent | None], Awaitable[None]],
+        on_error: Callable[[BaseException], Awaitable[None]] | None = None,
     ) -> Callable[[ASGIReceiveEvent], Awaitable[None]]:
         app_queue: asyncio.Queue[ASGIReceiveEvent] = asyncio.Queue(config.max_app_queue_size)
 
@@ -61,6 +65,7 @@ class TaskGroup:
             send,
             partial(self._loop.run_in_executor, None),
             _call_soon,
+            on_error,
         )
         return app_queue.put
 

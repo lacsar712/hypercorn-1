@@ -15,6 +15,7 @@ from .events import (
     StreamClosed,
     Trailers,
 )
+from .. import policy
 from ..config import Config
 from ..typing import (
     AppWrapper,
@@ -131,13 +132,28 @@ class HTTPStream:
             if self.app_put is not None:
                 await self.app_put({"type": "http.disconnect"})
 
+    def _keep_policy_disposition(self) -> policy.KeepPolicy | None:
+        # Read the stack live at finalisation, never from an entry snapshot.
+        run_phase = policy.current_phase("connection", create=True)
+        assert run_phase is not None
+        run_phase.response_finalizing = True
+        keep_policy = policy.current_policy(self.config).keep_policy
+        if keep_policy is policy.KeepPolicy.HONOR_KEEPALIVE:
+            return None
+        return keep_policy
+
     async def app_send(self, message: ASGISendEvent | None) -> None:
         if message is None:  # ASGI App has finished sending messages
             if not self.closed:
                 # Cleanup if required
                 if self.state == ASGIHTTPState.REQUEST:
                     await self._send_error_response(500)
-                await self.send(StreamClosed(stream_id=self.stream_id))
+                await self.send(
+                    StreamClosed(
+                        stream_id=self.stream_id,
+                        keep_policy=self._keep_policy_disposition(),
+                    )
+                )
         else:
             if message["type"] == "http.response.start" and self.state == ASGIHTTPState.REQUEST:
                 self.response = message
@@ -244,7 +260,12 @@ class HTTPStream:
         await self.send(EndBody(stream_id=self.stream_id))
         self.state = ASGIHTTPState.CLOSED
         await self.config.log.access(self.scope, self.response, time() - self.start_time)
-        await self.send(StreamClosed(stream_id=self.stream_id))
+        await self.send(
+            StreamClosed(
+                stream_id=self.stream_id,
+                keep_policy=self._keep_policy_disposition(),
+            )
+        )
 
     async def _send_error_response(self, status_code: int) -> None:
         await self.send(

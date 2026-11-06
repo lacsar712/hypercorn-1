@@ -7,6 +7,7 @@ from typing import Any
 
 from .task_group import TaskGroup
 from .worker_context import AsyncioSingleTask, WorkerContext
+from .. import policy
 from ..config import Config
 from ..events import Closed, Event, RawData, Updated
 from ..protocol import ProtocolWrapper
@@ -42,6 +43,7 @@ class TCPServer:
         return self.run().__await__()
 
     async def run(self) -> None:
+        policy.ensure_phase("connection")
         socket = self.writer.get_extra_info("socket")
         try:
             client = parse_socket_addr(socket.family, socket.getpeername())

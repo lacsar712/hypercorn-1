@@ -18,6 +18,7 @@ from .statsd import StatsdLogger
 from .tcp_server import TCPServer
 from .udp_server import UDPServer
 from .worker_context import WorkerContext
+from .. import policy
 from ..config import Config, Sockets
 from ..typing import AppWrapper, LifespanState
 from ..utils import (
@@ -60,6 +61,7 @@ async def worker_serve(
 ) -> None:
     config.set_statsd_logger_class(StatsdLogger)
 
+    policy.ensure_phase("worker")
     loop = asyncio.get_event_loop()
 
     if shutdown_trigger is None:

@@ -19,6 +19,7 @@ from .events import (
 )
 from .http_stream import HTTPStream
 from .ws_stream import WSStream
+from .. import policy
 from ..config import Config
 from ..events import Closed, Event, RawData, Updated
 from ..typing import AppWrapper, ConnectionState, H11SendableEvent, TaskGroup, WorkerContext
@@ -95,6 +96,8 @@ class H11Protocol:
         self.can_read = context.event_class()
         self.client = client
         self.config = config
+        self._draining = False
+        self._request_end_received = False
         self.connection: h11.Connection | H11WSConnection = h11.Connection(
             h11.SERVER, max_incomplete_event_size=self.config.h11_max_incomplete_size
         )
@@ -113,9 +116,16 @@ class H11Protocol:
     async def handle(self, event: Event) -> None:
         if isinstance(event, RawData):
             self.connection.receive_data(event.data)
-            await self._handle_events()
+            if self._draining:
+                # The single drainer parked in _drain_request_body owns
+                # event processing; just wake it with the new bytes.
+                await self.can_read.set()
+            else:
+                await self._handle_events()
         elif isinstance(event, Closed):
-            if self.stream is not None:
+            if self._draining:
+                await self._finish_drain_close()
+            elif self.stream is not None:
                 await self._close_stream()
 
     async def stream_send(self, event: StreamEvent) -> None:
@@ -123,6 +133,16 @@ class H11Protocol:
             if event.status_code >= 200:
                 headers = list(chain(event.headers, self.config.response_headers("h11")))
                 if self.keep_alive_requests >= self.config.keep_alive_max_requests:
+                    headers.append((b"connection", b"close"))
+                if (
+                    policy.current_policy(self.config).keep_policy
+                    is not policy.KeepPolicy.HONOR_KEEPALIVE
+                ):
+                    # force_close and drain_then_close both end the
+                    # connection after this response.
+                    headers = [
+                        (name, value) for name, value in headers if name.lower() != b"connection"
+                    ]
                     headers.append((b"connection", b"close"))
                 await self._send_h11_event(
                     h11.Response(
@@ -148,7 +168,7 @@ class H11Protocol:
         elif isinstance(event, EndData):
             pass
         elif isinstance(event, StreamClosed):
-            await self._maybe_recycle()
+            await self._maybe_recycle(event.keep_policy)
 
     async def _handle_events(self) -> None:
         while True:
@@ -168,6 +188,7 @@ class H11Protocol:
                 break
             else:
                 if isinstance(event, h11.Request):
+                    self._request_end_received = False
                     await self.send(Updated(idle=False))
                     await self._check_protocol(event)
                     await self._create_stream(event)
@@ -181,6 +202,7 @@ class H11Protocol:
                 elif isinstance(event, h11.Data):
                     await self.stream.handle(Body(stream_id=STREAM_ID, data=event.data))
                 elif isinstance(event, h11.EndOfMessage):
+                    self._request_end_received = True
                     await self.stream.handle(EndBody(stream_id=STREAM_ID))
                 elif isinstance(event, Data):
                     # WebSocket pass through
@@ -268,8 +290,40 @@ class H11Protocol:
         )
         await self._send_h11_event(h11.EndOfMessage())
 
-    async def _maybe_recycle(self) -> None:
+    async def _maybe_recycle(self, disposition: policy.KeepPolicy | None = None) -> None:
         await self._close_stream()
+        keep_policy = disposition
+        if keep_policy is None:
+            keep_policy = policy.current_policy(self.config).keep_policy
+        run_phase = policy.current_phase("connection", create=True)
+        assert run_phase is not None
+        run_phase.response_finalizing = True
+
+        if not isinstance(self.connection, h11.Connection):
+            # A WebSocket pass-through connection is never recycled.
+            if keep_policy is not policy.KeepPolicy.HONOR_KEEPALIVE:
+                run_phase.observe("keep_policy", keep_policy.value)
+            await self.can_read.set()
+            await self.send(Closed())
+            return
+
+        if keep_policy is policy.KeepPolicy.FORCE_CLOSE:
+            run_phase.observe("keep_policy", policy.KeepPolicy.FORCE_CLOSE.value)
+            await self.can_read.set()
+            await self.send(Closed())
+            return
+
+        if keep_policy is policy.KeepPolicy.DRAIN_THEN_CLOSE:
+            run_phase.observe("keep_policy", policy.KeepPolicy.DRAIN_THEN_CLOSE.value)
+            if self._request_end_received:
+                await self.can_read.set()
+                await self.send(Closed())
+            else:
+                self._draining = True
+                await self.can_read.set()
+                await self._drain_request_body()
+            return
+
         if (
             not self.context.terminated.is_set()
             and self.connection.our_state is h11.DONE
@@ -287,6 +341,46 @@ class H11Protocol:
         else:
             await self.can_read.set()
             await self.send(Closed())
+
+    async def _drain_request_body(self) -> None:
+        # Consume and discard the unread request body for the current
+        # message before closing the connection. Only the coroutine that
+        # entered draining runs this loop - incoming bytes wake it via
+        # can_read rather than re-entering the loop.
+        try:
+            while self._draining:
+                if self._request_end_received:
+                    break
+                their_state = self.connection.their_state
+                if their_state in {h11.DONE, h11.CLOSED, h11.ERROR}:
+                    break
+                try:
+                    event = self.connection.next_event()
+                except h11.RemoteProtocolError:
+                    break
+                except h11.LocalProtocolError:
+                    break
+                if event is h11.NEED_DATA:
+                    await self.can_read.clear()
+                    await self.can_read.wait()
+                    continue
+                if isinstance(event, h11.ConnectionClosed):
+                    break
+                if isinstance(event, h11.EndOfMessage):
+                    self._request_end_received = True
+                    break
+                # h11.Data and any other event are discarded.
+            await self._finish_drain_close()
+        except Exception:
+            await self._finish_drain_close()
+            raise
+
+    async def _finish_drain_close(self) -> None:
+        if not self._draining:
+            return
+        self._draining = False
+        await self.can_read.set()
+        await self.send(Closed())
 
     async def _close_stream(self) -> None:
         if self.stream is not None:

@@ -8,6 +8,7 @@ import trio
 
 from .task_group import TaskGroup
 from .worker_context import TrioSingleTask, WorkerContext
+from .. import policy
 from ..config import Config
 from ..events import Closed, Event, RawData, Updated
 from ..protocol import ProtocolWrapper
@@ -39,6 +40,7 @@ class TCPServer:
         return self.run().__await__()
 
     async def run(self) -> None:
+        policy.ensure_phase("connection")
         try:
             try:
                 with trio.fail_after(self.config.ssl_handshake_timeout):

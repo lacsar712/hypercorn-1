@@ -23,6 +23,7 @@ async def _handle(
     send: Callable[[ASGISendEvent | None], Awaitable[None]],
     sync_spawn: Callable,
     call_soon: Callable,
+    on_error: Callable[[BaseException], Awaitable[None]] | None = None,
 ) -> None:
     try:
         await app(scope, receive, send, sync_spawn, call_soon)
@@ -32,11 +33,15 @@ async def _handle(
         _, other_errors = error.split(trio.Cancelled)
         if other_errors is not None:
             await config.log.exception("Error in ASGI Framework")
+            if on_error is not None:
+                await on_error(other_errors)
             await send(None)
         else:
             raise
-    except Exception:
+    except Exception as error:
         await config.log.exception("Error in ASGI Framework")
+        if on_error is not None:
+            await on_error(error)
     finally:
         await send(None)
 
@@ -52,6 +57,7 @@ class TaskGroup:
         config: Config,
         scope: Scope,
         send: Callable[[ASGISendEvent | None], Awaitable[None]],
+        on_error: Callable[[BaseException], Awaitable[None]] | None = None,
     ) -> Callable[[ASGIReceiveEvent], Awaitable[None]]:
         app_send_channel, app_receive_channel = trio.open_memory_channel[ASGIReceiveEvent](
             config.max_app_queue_size
@@ -65,6 +71,7 @@ class TaskGroup:
             send,
             trio.to_thread.run_sync,
             trio.from_thread.run,
+            on_error,
         )
         return app_send_channel.send
 

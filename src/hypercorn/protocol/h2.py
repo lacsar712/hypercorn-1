@@ -22,6 +22,7 @@ from .events import (
 )
 from .http_stream import HTTPStream
 from .ws_stream import WSStream
+from .. import policy
 from ..config import Config
 from ..events import Closed, Event, RawData, Updated
 from ..typing import AppWrapper, ConnectionState, Event as IOEvent, TaskGroup, WorkerContext
@@ -29,6 +30,9 @@ from ..utils import filter_pseudo_headers
 
 BUFFER_HIGH_WATER = 2 * 2**14  # Twice the default max frame size (two frames worth)
 BUFFER_LOW_WATER = BUFFER_HIGH_WATER / 2
+
+# h2 error code REFUSED_STREAM, RFC 7540 Section 7
+REFUSED_STREAM_ERROR_CODE = 0x7
 
 
 class BufferCompleteError(Exception):
@@ -230,7 +234,13 @@ class H2Protocol:
                     await self._flush()
                 await self.send(Updated(idle=idle))
             elif isinstance(event, Request):
-                await self._create_server_push(event.stream_id, event.raw_path, event.headers)
+                surface = policy.current_policy(self.config).h2_surface
+                if surface is not policy.H2Surface.HONOR_MULTIPLEX:
+                    run_phase = policy.current_phase("connection", create=True)
+                    assert run_phase is not None
+                    run_phase.observe("h2_surface", "server_push_denied", surface.value)
+                else:
+                    await self._create_server_push(event.stream_id, event.raw_path, event.headers)
         except (
             BufferCompleteError,
             KeyError,
@@ -249,8 +259,22 @@ class H2Protocol:
                     self.connection.update_settings(
                         {h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: 0}
                     )
+                elif (
+                    policy.current_policy(self.config).h2_surface is policy.H2Surface.SINGLE_STREAM
+                    and self.streams
+                ):
+                    # At most one concurrent request stream on this
+                    # connection - refuse and reset the extra stream.
+                    run_phase = policy.current_phase("connection", create=True)
+                    assert run_phase is not None
+                    run_phase.observe("h2_surface", "stream_refused", "single_stream")
+                    self.connection.reset_stream(event.stream_id, REFUSED_STREAM_ERROR_CODE)
                 else:
                     await self._create_stream(event)
+                    if len(self.streams) > 1:
+                        run_phase = policy.current_phase("connection", create=True)
+                        assert run_phase is not None
+                        run_phase.multiplex_opened = True
                     await self.send(Updated(idle=False))
 
                 if self.keep_alive_requests > self.config.keep_alive_max_requests:

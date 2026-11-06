@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from hypercorn.typing import ConnectionState
+
+if TYPE_CHECKING:
+    from hypercorn.policy import KeepPolicy
 
 
 @dataclass(frozen=True)
@@ -62,4 +66,7 @@ class InformationalResponse(Event):
 
 @dataclass(frozen=True)
 class StreamClosed(Event):
-    pass
+    # Connection keep disposition resolved by the stream from the live
+    # policy stack at response finalisation. None means honour the stack
+    # again (or the existing keep-alive behaviour) at the connection level.
+    keep_policy: KeepPolicy | None = None

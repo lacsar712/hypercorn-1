@@ -9,6 +9,12 @@ import pytest
 from hypercorn.app_wrappers import ASGIWrapper
 from hypercorn.asyncio.lifespan import Lifespan
 from hypercorn.config import Config
+from hypercorn.policy import (
+    LifespanMode,
+    bind_phase,
+    current_policy,
+    policy_frame,
+)
 from hypercorn.typing import ASGIReceiveCallable, ASGISendCallable, Scope
 from hypercorn.utils import LifespanFailureError, LifespanTimeoutError
 from ..helpers import SlowLifespanFramework
@@ -89,3 +95,62 @@ async def test_lifespan_return() -> None:
     await lifespan.wait_for_shutdown()
     # Should complete (not hang)
     assert lifespan_task.done()
+
+
+async def _startup_then_shutdown_error_app(
+    scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable
+) -> None:
+    while True:
+        message = await receive()
+        if message["type"] == "lifespan.startup":
+            await send({"type": "lifespan.startup.complete"})
+        elif message["type"] == "lifespan.shutdown":
+            raise RuntimeError("shutdown boom")
+
+
+@pytest.mark.asyncio
+async def test_policy_suppress_startup_continues() -> None:
+    event_loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+
+    with bind_phase("worker") as bound, policy_frame(lifespan_mode=LifespanMode.SUPPRESS_STARTUP):
+        lifespan = Lifespan(ASGIWrapper(_lifespan_failure), Config(), event_loop, {})
+        lifespan_task = event_loop.create_task(lifespan.handle_lifespan())
+        # The startup failure does not raise, the run continues.
+        await lifespan.wait_for_startup()
+        await lifespan_task
+        assert lifespan_task.exception() is None
+        assert [obs.action for obs in bound.phase.observations] == ["startup_failure_suppressed"]
+    # Config is not permanently altered - the baseline is restored.
+    assert current_policy(Config()).lifespan_mode is LifespanMode.HONOR_STARTUP
+
+
+@pytest.mark.asyncio
+async def test_policy_strict_shutdown_blocks_clean_exit() -> None:
+    event_loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+
+    with bind_phase("worker") as bound, policy_frame(lifespan_mode=LifespanMode.STRICT_SHUTDOWN):
+        lifespan = Lifespan(ASGIWrapper(_startup_then_shutdown_error_app), Config(), event_loop, {})
+        lifespan_task = event_loop.create_task(lifespan.handle_lifespan())
+        await lifespan.wait_for_startup()
+        await lifespan.wait_for_shutdown()
+        with pytest.raises(RuntimeError, match="shutdown boom"):
+            await lifespan_task
+        assert bound.phase.shutdown_failed is True
+        assert bound.phase.clean_exit is False
+        assert [obs.action for obs in bound.phase.observations] == ["shutdown_failure_strict"]
+
+
+@pytest.mark.asyncio
+async def test_policy_honor_shutdown_error_is_clean_baseline() -> None:
+    event_loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+
+    with bind_phase("worker") as bound:
+        lifespan = Lifespan(ASGIWrapper(_startup_then_shutdown_error_app), Config(), event_loop, {})
+        lifespan_task = event_loop.create_task(lifespan.handle_lifespan())
+        await lifespan.wait_for_startup()
+        # Existing behaviour: framework error during shutdown is logged and
+        # the worker exits without the error propagating.
+        await lifespan.wait_for_shutdown()
+        await lifespan_task
+        assert lifespan_task.exception() is None
+        assert bound.phase.clean_exit is True

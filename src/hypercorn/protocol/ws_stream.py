@@ -21,6 +21,7 @@ from wsproto.handshake import server_extensions_handshake, WEBSOCKET_VERSION
 from wsproto.utilities import generate_accept_token, LocalProtocolError, split_comma_header
 
 from .events import Body, Data, EndBody, EndData, Event, Request, Response, StreamClosed
+from .. import policy
 from ..config import Config
 from ..typing import (
     AppWrapper,
@@ -230,9 +231,23 @@ class WSStream:
             elif not self.handshake.is_valid():
                 await self._send_error_response(400)
                 self.closed = True
+            elif policy.current_policy(self.config).ws_mode is policy.WSMode.DENY_UPGRADE:
+                # Reject the upgrade over HTTP, never enter a connected
+                # WebSocket session.
+                run_phase = policy.current_phase("connection", create=True)
+                assert run_phase is not None
+                run_phase.observe("ws_mode", "upgrade_denied")
+                await self.config.log.warning(
+                    "WebSocket upgrade denied by policy ws_mode=deny_upgrade"
+                )
+                await self._send_error_response(403)
+                self.closed = True
             else:
+                on_error = None
+                if policy.current_policy(self.config).ws_mode is policy.WSMode.CLOSE_ON_EXC:
+                    on_error = self._policy_app_error
                 self.app_put = await self.task_group.spawn_app(
-                    self.app, self.config, self.scope, self.app_send
+                    self.app, self.config, self.scope, self.app_send, on_error=on_error
                 )
                 await self.app_put({"type": "websocket.connect"})
         elif isinstance(event, (Body, Data)) and not self.handshake.accepted:
@@ -347,6 +362,18 @@ class WSStream:
             await self.send(Data(stream_id=self.stream_id, data=data))
 
     async def _accept(self, message: WebsocketAcceptEvent) -> None:
+        run_phase = policy.current_phase("connection", create=True)
+        assert run_phase is not None
+        if policy.current_policy(self.config).ws_mode is policy.WSMode.DENY_UPGRADE:
+            # A deny_upgrade frame pushed before the app attempted to
+            # accept is honoured rather than silently accepting.
+            run_phase.observe("ws_mode", "upgrade_denied", "at_accept")
+            await self.config.log.warning("WebSocket upgrade denied by policy ws_mode=deny_upgrade")
+            await self._send_error_response(403)
+            self.state = ASGIWebsocketState.HTTPCLOSED
+            self.closed = True
+            return
+        run_phase.ws_accepted = True
         self.state = ASGIWebsocketState.CONNECTED
         status_code, headers, self.connection = self.handshake.accept(
             message.get("subprotocol"), message.get("headers", [])
@@ -383,3 +410,26 @@ class WSStream:
         while not self.closed:
             await self._send_wsproto_event(Ping())
             await self.context.sleep(self.config.websocket_ping_interval)
+
+    async def _policy_app_error(self, error: BaseException) -> None:
+        # Read the stack live - an inner frame popped after the session
+        # started must fall back to the outer frame behaviour.
+        effective = policy.current_policy(self.config)
+        if effective.ws_mode is not policy.WSMode.CLOSE_ON_EXC:
+            return
+        if self.state is not ASGIWebsocketState.CONNECTED or self.closed:
+            # Pre-accept crashes take the HTTP error response path.
+            return
+        run_phase = policy.current_phase("connection", create=True)
+        assert run_phase is not None
+        run_phase.observe("ws_mode", "closed_on_exception", type(error).__name__)
+        await self.config.log.error(
+            "Unhandled application error in WebSocket session, policy ws_mode=close_on_exc "
+            "closes the session"
+        )
+        # Close the WebSocket session observably; this must never look like
+        # an HTTP keep-alive response.
+        self.state = ASGIWebsocketState.CLOSED
+        await self._send_wsproto_event(CloseConnection(code=CloseReason.INTERNAL_ERROR))
+        self.closed = True
+        await self.send(StreamClosed(stream_id=self.stream_id))

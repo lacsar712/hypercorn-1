@@ -319,6 +319,7 @@ class TaskGroup(Protocol):
         config: Config,
         scope: Scope,
         send: Callable[[ASGISendEvent | None], Awaitable[None]],
+        on_error: Callable[[BaseException], Awaitable[None]] | None = ...,
     ) -> Callable[[ASGIReceiveEvent], Awaitable[None]]:
         pass
 
